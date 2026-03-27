@@ -550,131 +550,109 @@ This test validates the adapter's behavior when the Maestro server is unreachabl
 | **Automation** | Not Automated |
 | **Version** | MVP |
 | **Created** | 2026-02-12 |
-| **Updated** | 2026-02-26 |
+| **Updated** | 2026-03-27 |
 
 ---
 
 ### Preconditions
 
-1. HyperFleet API, Sentinel, and Adapter are deployed and running
-2. Adapter is deployed in Maestro transport mode and initially connected to Maestro
-3. Ability to scale down the Maestro deployment
+1. Environment is prepared using [hyperfleet-infra](https://github.com/openshift-hyperfleet/hyperfleet-infra) with all required platform resources
+2. HyperFleet API and HyperFleet Sentinel services are deployed and running successfully
+3. Adapter is deployed in Maestro transport mode and initially connected to Maestro
+4. Ability to scale down the Maestro deployment
 
 ---
 
 ### Test Steps
 
-#### Step 1: Verify adapter is running and Maestro is healthy
+#### Step 1: Scale down Maestro to simulate unavailability
 **Action:**
-```bash
-kubectl get pods -n hyperfleet -l app.kubernetes.io/instance=hyperfleet-${ADAPTER_NAME} --no-headers
-kubectl get pods -n maestro -l app=maestro --no-headers
-```
-
-**Expected Result:**
-- Both ${ADAPTER_NAME} and maestro pods are `Running`
-
-#### Step 2: Scale down Maestro to simulate unavailability
-**Action:**
+- Scale down the Maestro deployment to make the Maestro server unreachable:
 ```bash
 kubectl scale deployment maestro -n maestro --replicas=0
 ```
 
 **Expected Result:**
-- Maestro pod terminates, gRPC and HTTP endpoints become unreachable
+- Maestro gRPC and HTTP endpoints become unreachable
 
-#### Step 3: Create a cluster while Maestro is down
+#### Step 2: Submit an API request to create a Cluster resource
 **Action:**
+- Submit a POST request to create a Cluster resource:
 ```bash
-CLUSTER_ID=$(curl -s -X POST ${API_URL}/api/hyperfleet/v1/clusters \
+curl -X POST ${API_URL}/api/hyperfleet/v1/clusters \
   -H "Content-Type: application/json" \
-  -d '{
-    "kind": "Cluster",
-    "name": "maestro-unavail-test-'$(date +%Y%m%d-%H%M%S)'",
-    "spec": {
-      "platform": {"type": "gcp", "gcp": {"projectID": "test", "region": "us-central1"}},
-      "release": {"version": "4.14.0"}
-    }
-  }' | jq -r '.id')
-echo "CLUSTER_ID=${CLUSTER_ID}"
+  -d @testdata/payloads/clusters/cluster-request.json
 ```
 
 **Expected Result:**
-- Cluster creation succeeds (API is independent of Maestro)
+- API returns successful response with cluster ID (API is independent of Maestro)
 
-#### Step 4: Verify adapter error handling (check logs after ~15 seconds)
+#### Step 3: Verify adapter failure is reported via status API
+
 **Action:**
+- Poll adapter statuses until the Maestro adapter reports its status:
 ```bash
-kubectl logs -n hyperfleet -l app.kubernetes.io/instance=hyperfleet-${ADAPTER_NAME} --tail=30 \
-  | grep -E "FAILED|error|connection refused" | head -5
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}/statuses
 ```
 
 **Expected Result:**
-- Adapter logs show Maestro connection error
-- Adapter does NOT crash (pod remains Running)
+- The Maestro adapter is present in the statuses response (adapter handled the error gracefully without crashing)
+- The adapter reports `Applied` condition with `status: "False"`
+- The adapter reports `Available` condition with `status: "False"`
+- The adapter reports `Health` condition with `status: "False"`, with reason and message indicating Maestro connection failure
 
-> **Note:** The error code `hyperfleet-adapter-16` is the adapter's internal MaestroError code (code 16 in the adapter's error enumeration, not a gRPC status code).
+#### Step 4: Verify cluster top-level status reflects adapter failure
 
-#### Step 5: Verify error status reported to HyperFleet API
 **Action:**
+- Retrieve cluster status:
 ```bash
-curl -s ${API_URL}/api/hyperfleet/v1/clusters/${CLUSTER_ID}/statuses \
-  | jq '.items[] | select(.adapter == "'"${ADAPTER_NAME}"'") | .conditions'
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}
 ```
 
 **Expected Result:**
-- Health condition: `status: "False"`, error message should contain key points like `connection refused` or `hyperfleet-adapter-16`
-- Applied condition: `status: "False"`
+- Cluster `Ready` condition remains `status: "False"`
+- Cluster `Available` condition remains `status: "False"`
+- Cluster does not transition to Ready state while the Maestro adapter reports failure
 
-#### Step 6: Verify adapter pod is still running (no crash)
+#### Step 5: Restore Maestro and verify recovery
 **Action:**
-```bash
-kubectl get pods -n hyperfleet -l app.kubernetes.io/instance=hyperfleet-${ADAPTER_NAME} --no-headers
-```
-
-**Expected Result:**
-- Pod is `Running` with 0 restarts
-
-#### Step 7: Restore Maestro and verify recovery
-**Action:**
+- Scale up the Maestro deployment:
 ```bash
 kubectl scale deployment maestro -n maestro --replicas=1
-kubectl rollout status deployment/maestro -n maestro --timeout=120s
+```
+- Poll adapter statuses until the Maestro adapter recovers:
+```bash
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}/statuses
+```
+- Retrieve cluster status:
+```bash
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}
 ```
 
 **Expected Result:**
-- Maestro pod becomes `Running`
+- Maestro adapter conditions transition to: `Applied=True`, `Available=True`, `Health=True`
+- Cluster `Ready` condition transitions to `status: "True"`
+- Cluster `Available` condition transitions to `status: "True"`
 
-> **Note:** After Maestro restores, the adapter's CloudEvents client (MQTT-based) takes a few seconds to re-establish the connection. During this window, events fail with "the cloudevents client is not ready". The adapter automatically recovers once the connection is restored.
+> **Note:** After Maestro restores, the adapter's CloudEvents client (MQTT-based) takes 60-90 seconds to re-establish the connection. During this window, events may fail with "the cloudevents client is not ready". The adapter automatically recovers once the connection is restored.
 
-#### Step 8: Verify recovery - resources created and status updated
+#### Step 6: Cleanup Resources (AfterEach)
+
 **Action:**
+- Delete the namespace created for this cluster:
 ```bash
-# Verify resources now exist
-kubectl get ns | grep ${CLUSTER_ID}-${ADAPTER_NAME}
-
-# Verify status updated
-curl -s ${API_URL}/api/hyperfleet/v1/clusters/${CLUSTER_ID}/statuses \
-  | jq '.items[] | select(.adapter == "'"${ADAPTER_NAME}"'") | .conditions[] | select(.type == "Health")'
+kubectl delete namespace {cluster_id}
 ```
+- Restore Maestro to normal state (if not already restored)
 
 **Expected Result:**
-- Namespace created after recovery
-- Health returns to `True`
+- Namespace and all associated resources are deleted successfully
+- Maestro is running normally
 
-#### Step 9: Cleanup
-**Action:**
+**Note:** This is a workaround cleanup method. Once the HyperFleet API supports DELETE operations for clusters, this step should be replaced with:
 ```bash
-kubectl delete ns ${CLUSTER_ID}-${ADAPTER_NAME}-namespace --ignore-not-found
-
-# Ensure Maestro is fully restored
-kubectl get pods -n maestro --no-headers
+curl -X DELETE ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}
 ```
-
-> **Note:** This is a workaround cleanup method. Once the HyperFleet API supports DELETE operations for clusters, this step should be replaced with:
-> ```bash
-> curl -X DELETE ${API_URL}/api/hyperfleet/v1/clusters/${CLUSTER_ID}
-> ```
 
 ---
 

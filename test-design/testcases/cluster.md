@@ -472,7 +472,7 @@ This test validates the system's self-healing capability. When an adapter crashe
 | **Automation** | Not Automated |
 | **Version** | MVP |
 | **Created** | 2026-02-11 |
-| **Updated** | 2026-03-12 |
+| **Updated** | 2026-03-27 |
 
 
 ---
@@ -481,17 +481,24 @@ This test validates the system's self-healing capability. When an adapter crashe
 
 1. Environment is prepared using [hyperfleet-infra](https://github.com/openshift-hyperfleet/hyperfleet-infra) with all required platform resources
 2. HyperFleet API and HyperFleet Sentinel services are deployed and running successfully
+3. The adapters defined in testdata/adapter-configs are all deployed successfully
 
 ---
 
 ### Test Steps
 
-#### Step 1: Deploy dedicated crash-adapter with pre-configured crash behavior
+#### Step 1: Simulate adapter crash by scaling down one required adapter
+
 **Action:**
-- Deploy a crash-adapter via Helm with `SIMULATE_RESULT=crash`, separate from the normal adapters used in other tests
+- Scale down one of the required adapters (e.g., `cl-namespace`) to simulate a crash:
+```bash
+kubectl scale deployment ${ADAPTER_DEPLOYMENT_NAME} --replicas=0
+```
 
 **Expected Result:**
-- crash-adapter is deployed and running successfully
+- Adapter becomes unavailable
+
+> **Note:** The original test design proposed using `SIMULATE_RESULT=crash` to make the adapter pod crash. However, `SIMULATE_RESULT` only affects the Job container within the adapter's task execution, not the adapter pod itself. Scaling down the deployment is used as a practical alternative to simulate adapter unavailability.
 
 #### Step 2: Submit an API request to create a Cluster resource
 
@@ -506,61 +513,57 @@ curl -X POST ${API_URL}/api/hyperfleet/v1/clusters \
 **Expected Result:**
 - API returns successful response with cluster ID
 
-#### Step 3: Verify crash-adapter has not reported status
+#### Step 3: Verify the crashed adapter has not reported status
 
 **Action:**
-- Check cluster adapter statuses via API:
+- Poll adapter statuses:
 ```bash
-curl -s ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}/statuses | jq '.items[].adapter'
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}/statuses
 ```
-- Check crash-adapter pod status:
+- Retrieve cluster status:
 ```bash
-kubectl get pods -n hyperfleet -l app.kubernetes.io/instance=crash-adapter --no-headers
-```
-
-**Expected Result:**
-- API: statuses response does not contain an entry for `crash-adapter` (it crashed before reporting status)
-- kubectl: crash-adapter pod shows CrashLoopBackOff or Error state
-
-#### Step 4: Restore crash-adapter to normal mode
-
-**Action:**
-- Upgrade crash-adapter Helm release with `SIMULATE_RESULT=success`
-
-**Expected Result:**
-- crash-adapter pod starts and remains Running
-
-#### Step 5: Verify adapter eventually reports correct status
-
-**Action:**
-- Poll crash-adapter status via API until it appears:
-```bash
-curl -s ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}/statuses \
-  | jq '.items[] | select(.adapter == "crash-adapter")'
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}
 ```
 
 **Expected Result:**
-- crash-adapter status entry is now present in the statuses response
-- crash-adapter reports all three condition types with `status: "True"`: `Applied`, `Available`, `Health`
+- Statuses response does not contain an entry for the crashed adapter (e.g., `cl-namespace` is absent)
+- Other required adapters have reported their statuses
+- Cluster `Ready` condition remains `status: "False"`
+
+#### Step 4: Restore adapter and verify cluster reaches correct status
+
+**Action:**
+- Scale up the adapter deployment back to 1 replica:
+```bash
+kubectl scale deployment ${ADAPTER_DEPLOYMENT_NAME} --replicas=1
+```
+- Poll adapter statuses until the restored adapter reports:
+```bash
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}/statuses
+```
+- Retrieve cluster status:
+```bash
+curl -X GET ${API_URL}/api/hyperfleet/v1/clusters/{cluster_id}
+```
+
+**Expected Result:**
+- Restored adapter status entry is now present in the statuses response
+- Restored adapter reports all three condition types with `status: "True"`: `Applied`, `Available`, `Health`
 - `observed_generation` is set to `1`
+- Cluster `Ready` condition transitions to `status: "True"`
+- Cluster `Available` condition transitions to `status: "True"`
+- This confirms no cluster is left in an inconsistent state due to adapter failures
 
-#### Step 6: Cleanup Resources (AfterEach)
+#### Step 5: Cleanup Resources (AfterEach)
 
 **Action:**
 - Delete the namespace created for this cluster:
 ```bash
 kubectl delete namespace {cluster_id}
 ```
-- Uninstall the crash-adapter Helm release
-- Clean up the Pub/Sub subscription created by the adapter (if using Google Pub/Sub broker):
-```bash
-gcloud pubsub subscriptions delete {subscription_id} --project={project_id}
-```
 
 **Expected Result:**
 - Namespace and all associated resources are deleted successfully
-- crash-adapter deployment is removed
-- Pub/Sub subscription is deleted (if applicable)
 
 **Note:** This is a workaround cleanup method. Once CLM supports DELETE operations for "clusters" resource type, the namespace deletion should be replaced with:
 ```bash
